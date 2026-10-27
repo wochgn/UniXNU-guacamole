@@ -1,0 +1,152 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 2a2322c..3a00705 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7206,8 +7206,13 @@ done:
+ 	    error, cache_authorized, root_recheck, (unsigned long long)dyld_flags);
+ 	if (!error && cache_authorized && root_recheck) {
+ 		/* Original dyld bit 3 selects no ignition; the owner chain and actual
+-		 * readonly mounts above supply image authentication in this mode. */
+-		dyld_flags |= UINT64_C(8);
++		 * readonly mounts above supply image authentication in this mode.
++		 * owner-dyld-no-ignition=0 leaves the bit clear so dyld takes the
++		 * ignition path and lets libignition provide the shared cache. */
++		int owner_no_ignition = 1;
++		PE_parse_boot_argn("owner-dyld-no-ignition", &owner_no_ignition,
++		    sizeof(owner_no_ignition));
++		if (owner_no_ignition) dyld_flags |= UINT64_C(8);
+ 		commpage_update_dyld_flags(dyld_flags);
+ 		native_owner_cache_dyld_flags = dyld_flags;
+ 		printf("GUAC-OWNER: startup flags=%llx\n", (unsigned long long)dyld_flags);
+@@ -8138,38 +8143,25 @@ static int
+ guac_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+ {
+ 	static const char cache_uuid[] = "8846FE78-2910-4297-AF97-D59BB6F8FC16";
+-	static const char mountpoint[] = "/System/Cryptexes/OS";
++	static const char mountpoint[] = "/";
+ 	static const char cache_env[] =
+-	    "DYLD_SHARED_CACHE_DIR=/System/Cryptexes/OS/System/Library/Caches/com.apple.dyld";
+-	static const char lib_env[] = "DYLD_FALLBACK_LIBRARY_PATH=/System/Cryptexes/OS/usr/lib";
++	    "DYLD_SHARED_CACHE_DIR=/System/Library/Caches/com.apple.dyld";
++	static const char lib_env[] = "DYLD_FALLBACK_LIBRARY_PATH=/usr/lib";
+ 	char device_path[64] = {0};
+ 	uint8_t mount_data[0x150] = {0};
+-	uint64_t mount_flags = MNT_RDONLY;
++	uint64_t mount_flags = MNT_RDONLY | MNT_UNION;
+ 	uint16_t mount_mode = 1;
+ 	uint32_t anonymous_owner = 99;
+ 	user64_addr_t spec = scratch + 0x160;
+ 	user64_addr_t environment[3] = {scratch + 0x400, scratch + 0x600, USER_ADDR_NULL};
+ 	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120,
+-	    .flags = MNT_RDONLY, .data = scratch + 0x200};
++	    .flags = MNT_RDONLY | MNT_UNION, .data = scratch + 0x200};
+ 	int32_t result = 0;
+ 	int error;
+ 
+ 	if (!guac_media_find_volume(cache_uuid, device_path, sizeof(device_path))) {
+ 		return ENOENT;
+ 	}
+-	/* The cryptex mountpoint is absent on the restore image; create it the
+-	 * same way the Data prepare creates its scratch directory. */
+-	{
+-		struct mkdir_args mkdir_request = {.path = scratch + 0xa00, .mode = 0755};
+-		int32_t mkdir_result = 0;
+-		if (copyout("/System/Cryptexes", mkdir_request.path, sizeof("/System/Cryptexes")) == 0) {
+-			(void)mkdir(p, &mkdir_request, &mkdir_result);
+-		}
+-		if (copyout("/System/Cryptexes/OS", mkdir_request.path, sizeof("/System/Cryptexes/OS")) == 0) {
+-			(void)mkdir(p, &mkdir_request, &mkdir_result);
+-		}
+-		printf("GUAC-SYSOS: mkdir cryptexes -> %d\n", mkdir_result);
+-	}
+ 	memcpy(mount_data, &spec, sizeof(spec));
+ 	memcpy(mount_data + 8, &mount_flags, sizeof(mount_flags));
+ 	memcpy(mount_data + 16, &mount_mode, sizeof(mount_mode));
+@@ -8188,17 +8180,50 @@ guac_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+ 		printf("GUAC-SYSOS: mount %s at %s probe=%d\n", device_path, mountpoint, probe_error);
+ 		if (!probe_error) vnode_put(probe_vp);
+ 	}
++	{
++		/* Read the scratch strings back with the current context and probe
++		 * the mountpoint under both the kernel and the current context. */
++		char echo[64] = {0};
++		size_t echoed = 0;
++		int e_type = copyinstr(request.type, echo, sizeof(echo), &echoed);
++		printf("GUAC-SYSOS: type echo=%d '%s'\n", e_type, echo);
++		memset(echo, 0, sizeof(echo));
++		int e_path = copyinstr(request.path, echo, sizeof(echo), &echoed);
++		printf("GUAC-SYSOS: path echo=%d '%s'\n", e_path, echo);
++		vnode_t mp_kern = NULLVP, mp_cur = NULLVP;
++		int e_kern = vnode_lookup(mountpoint, 0, &mp_kern, vfs_context_kernel());
++		int e_cur = vnode_lookup(mountpoint, 0, &mp_cur, vfs_context_current());
++		printf("GUAC-SYSOS: mountpoint probe kern=%d cur=%d\n", e_kern, e_cur);
++		if (!e_kern) vnode_put(mp_kern);
++		if (!e_cur) vnode_put(mp_cur);
++	}
+ 	error = mount(p, &request, &result);
+ 	printf("GUAC-SYSOS: mount result=%d\n", error);
+ 	if (error) {
+ 		return error;
+ 	}
+-	if ((error = copyout(cache_env, environment[0], sizeof(cache_env))) != 0 ||
+-	    (error = copyout(lib_env, environment[1], sizeof(lib_env))) != 0 ||
+-	    (error = copyout(environment, scratch + 0x500, sizeof(environment))) != 0) {
+-		return error;
++	/* QEMU/SystemOS: leave the environment untouched, matching the owner
++	 * union path. The union already exposes the default dyld cache dir. */
++	(void)cache_env; (void)lib_env; (void)environment;
++	*envp = USER_ADDR_NULL;
++	/* The owner path publishes a valid commpage dyld state; mirror it so the
++	 * original dyld takes the cache path instead of the filesystem fallback. */
++	extern void commpage_update_dyld_flags(uint64_t);
++	commpage_update_dyld_flags(0);
++	{
++		static const char *const probes[] = {
++			"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64",
++			"/System/Library/Caches/com.apple.dyld",
++			"/usr/lib/libSystem.B.dylib",
++			"/usr/lib/dyld",
++		};
++		for (unsigned i = 0; i < sizeof(probes)/sizeof(probes[0]); i++) {
++			vnode_t vp = NULLVP;
++			int e = vnode_lookup(probes[i], 0, &vp, vfs_context_kernel());
++			printf("GUAC-SYSOS: post-mount probe %s -> %d\n", probes[i], e);
++			if (!e) vnode_put(vp);
++		}
+ 	}
+-	*envp = scratch + 0x500;
+ 	return 0;
+ }
+ #endif /* XNU_GUAC_SYSTEMOS_MOUNT */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 34c921b..d32c0fe 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -843,6 +843,8 @@ __mac_mount(struct proc *p, register struct __mac_mount_args *uap, __unused int3
+ 	if (error) {
+ 		return error;
+ 	}
++	printf("GUAC-MNT: type=%s path=0x%llx data=0x%llx\n", fstypename,
++	    (unsigned long long)uap->path, (unsigned long long)uap->data);
+ 
+ retry:
+ 	/*
+@@ -855,8 +857,10 @@ retry:
+ 	}
+ 	error = namei(&nd);
+ 	if (error) {
++		printf("GUAC-MNT: namei -> %d\n", error);
+ 		goto out;
+ 	}
++	printf("GUAC-MNT: namei ok vp=%p pvp=%p\n", nd.ni_vp, nd.ni_dvp);
+ 	need_nameidone = 1;
+ 	vp = nd.ni_vp;
+ 	pvp = nd.ni_dvp;
+@@ -959,6 +963,7 @@ retry:
+ 
+ 	error = mount_common(fstypename, pvp, vp, &nd.ni_cnd, uap->data, flags, 0,
+ 	    labelstr, ctx);
++	printf("GUAC-MNT: mount_common -> %d\n", error);
+ 
+ out:
+ 

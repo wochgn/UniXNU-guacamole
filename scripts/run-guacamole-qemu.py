@@ -65,6 +65,10 @@ def main():
     p.add_argument('--stop', default='_handle_breakpoint',
                    help='first GDB stop symbol (the user BRK handler = the dyld trap)')
     p.add_argument('--also-stop', action='append', default=[])
+    p.add_argument('--skip-target-hits', type=int, default=0,
+                   help='skip earlier hits of the primary breakpoint')
+    p.add_argument('--trace', action='append', default=[], metavar='SYMBOL_OR_HEX',
+                   help='one-shot tracepoint: record pc/x0 at the first hit, keep running')
     p.add_argument('--read-symbol', action='append', default=[], metavar='SYMBOL:BYTES')
     p.add_argument('--read-address', action='append', default=[], metavar='HEX_ADDRESS:HEX_BYTES')
     p.add_argument('--args', default=DEFAULT_ARGS)
@@ -74,6 +78,12 @@ def main():
     p.add_argument('--plan-json', default=None, help='process/thread layout plan JSON for the thread snapshot')
     p.add_argument('--inspect-threads', action='store_true', help='with --plan-json, capture launchd/UI thread snapshots')
     p.add_argument('--allproc-symbol', default=None, help='dump the kernel allproc list at the final stop, resolving this symbol')
+    p.add_argument('--display', default='none', choices=['none', 'gtk', 'sdl', 'default', 'egl-headless'],
+                   help='QEMU display backend; gtk/sdl open a live guest window')
+    p.add_argument('--ramfb', action='store_true', help='attach a ramfb so the UEFI GOP console is visible')
+    p.add_argument('--capture-screen', action='store_true', help='capture a PNG of the guest screen at the stop')
+    p.add_argument('--vnc', default=None, metavar='ADDR',
+                   help='serve the guest display over VNC (e.g. 127.0.0.1:5 -> port 5905)')
     p.add_argument('--console', action='store_true', default=True, help='capture the virtio kernel console')
     p.add_argument('--no-console', dest='console', action='store_false')
     a = p.parse_args()
@@ -150,6 +160,10 @@ def main():
     before = "'driver': 'raw', 'node-name': 'offline-extra', 'read-only': True,"
     assert content.count(before) == 1
     content = content.replace(before, before + f" 'offset': {system_window['offset']}, 'size': {system_window['size']},")
+    content = content.replace("'-display', 'none'", f"'-display', {a.display!r}")
+    if a.vnc:
+        content = content.replace(f"'-display', {a.display!r},",
+                                  f"'-display', {a.display!r}, '-vnc', {a.vnc!r},")
     gdb_script = out / 'gdb-stop-root-window.py'
     gdb_script.write_text(content)
 
@@ -232,6 +246,8 @@ def main():
         command += ['--virtio-console-socket', str(console_sock)]
     for name in a.also_stop:
         command += ['--also-stop', sym(name)]
+    for name in a.trace:
+        command += ['--trace-address', sym(name)]
     for request in a.read_symbol:
         nm, size = request.rsplit(':', 1)
         command += ['--read-memory', f'{sym(nm)}:{int(size, 0):x}']
@@ -250,6 +266,12 @@ def main():
             command.append('--inspect-ui-threads')
     if a.finish:
         command.append('--finish-function')
+    if a.skip_target_hits:
+        command += ['--skip-target-hits', str(a.skip_target_hits)]
+    if a.ramfb:
+        command.append('--qemu-ramfb')
+    if a.capture_screen:
+        command += ['--capture-screen', '--qemu-ramfb']
 
     (out / 'command.json').write_text(json.dumps(command, indent=2))
     with (out / 'runner.log').open('w') as log:

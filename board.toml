@@ -163,6 +163,8 @@ kernel_args = [
   # Userland bring-up.
   "launchd_unsecure_cache=1",
   "ignition_level=1",
+  "ignition_force_dylib_root=rootfs",
+  "owner-dyld-no-ignition=0",
   "wdt=-1",
   "root-live-fs=1",
   "allow-root-hash-mismatch=1",

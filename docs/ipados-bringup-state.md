@@ -375,3 +375,57 @@ cumulative patch has been re-applied somewhere.
       one `serial_console.c` hunk (`.rej` files kept in the work tree).
       Remaining: per-file `-DXNU_QCOM_USB_DEBUG=1`, the include path, the
       archive force-load, `qcom-usb-debug=1`, host `collect-xnu-usb.py`.
+
+## 2026-10-27: QEMU/phone dual-config, SystemOS union in QEMU, dyld and ignition state
+
+### One source tree, two kernel configs
+
+`board.toml` names one defconfig; the phone builds `guacamole_10063_defconfig`
+(ARM_DT platform, `NATIVE_UFS`, `SHENG_PMGR`, `NATIVE_AES`, the
+`OWNER_ROOT_*`/`OWNER_CACHE_*`/`OWNER_UNION_SYSTEMOS` verified-root chain).
+The QEMU kernel is the same tree and the same iPad7 kernelcache built with
+`guacamole_qemu_defconfig` (ARMVIRT platform, `NATIVE_VIRTIO_BLOCK/CONSOLE`,
+`GUAC_SYSTEMOS_MOUNT`, no owner chain). The two configs now both set
+`CONFIG_XNU_NATIVE_AES=y`: without it the original AppleImage4 never starts,
+libignition blocks on the ignition blob and launchd never reaches dyld.
+
+Build the QEMU kernel by pointing `board.toml` at the qemu defconfig and
+running `scripts/build-local-linux.sh`; the payload step then fails with
+`the native UFS root kernel lacks the linked sheng PMGR integration`, which is
+expected — the prelinked kernel is already produced and is copied to
+`out/guacamole/qemu-kernel.macho`. Restore the defconfig afterwards.
+
+### QEMU SystemOS mount (`patches/xnu/zzzzz-guac-qemu-systemos-union.patch`)
+
+The original QEMU helper mounted the cryptex at `/System/Cryptexes/OS` after
+`mkdir` calls. The root volume is read-only, so both `mkdir` calls fail while
+their `int32_t` retvals stay zero (`GUAC-SYSOS: mkdir cryptexes -> 0/0`) and the
+`namei` of the mountpoint returns ENOENT (`GUAC-MNT: namei -> 2`). The patch
+mounts the SystemOS volume read-only with `MNT_UNION` at `/` instead — the same
+shape as the phone's owner union path — drops the exec environment, publishes
+`commpage_update_dyld_flags(0)` (the owner path publishes the dyld state) and
+keeps bounded GUAC-SYSOS/GUAC-MNT probes. The mount then returns 0,
+`/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64` resolves, and
+`/usr/lib/libSystem.B.dylib` correctly does not exist outside the cache.
+
+The same patch makes the phone-side `dyld |= 8` (no-ignition) selection
+optional through `owner-dyld-no-ignition=<0|1>`; the per-board boot args in
+`board.toml` now carry `ignition_force_dylib_root=rootfs` (string, maps to
+`force dylib root: 0x3`) and `owner-dyld-no-ignition=0`.
+
+### State reached on both sides
+
+- Phone: union mount of the SystemOS at `/`, `ignition sequence complete`,
+  `dylib_cache: opened shared cache directory`, shared-region mapping
+  (`GUAC-SR: final first=0x1e134000`, `check_np <- 0x1e134000`), 4 KiB code
+  signature preparation over the cache, then `brk #1` in mapped cache code
+  with `x0=0xffffffffffffffed` (ENODEV) and initproc panic (signal namespace).
+- QEMU: the same union, ignition and cache exposure; dyld loads the cache (the
+  same `GUAC-CS` preparation, including the 114 MB cache), launchd runs in its
+  own text and no panic is observed at the 300 s observer deadline.
+
+Diagnostics used: `GUAC-SR` (shared region), `GUAC-CS` (4 KiB signature prep),
+`GUAC-MNT`/`GUAC-SYSOS` (QEMU mount path). The QEMU runner gained
+`--ramfb --capture-screen` (QMP screendump to `screen.png`; the build only
+ships the `none` display backend) and `--vnc ADDR` (VNC backend verified) so the
+guest console image can be inspected without a phone.
