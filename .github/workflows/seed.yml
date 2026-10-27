@@ -1,20 +1,22 @@
-name: guacamole data seed
+name: data-seed
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 jobs:
-  seed:
+  build:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Build the DBRDISK1 Data seed
+
+      - name: Build Data seed with Preboot volume
         run: bash scripts/build-data-seed-macos.sh build/data-seed
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload seed artifact
+        uses: actions/upload-artifact@v4
         with:
           name: data-seed
           path: |
             build/data-seed/data-seed.dbr
             build/data-seed/data-seed.json
-      - name: Report
-        run: cat build/data-seed/data-seed.json
+          if-no-files-found: error
