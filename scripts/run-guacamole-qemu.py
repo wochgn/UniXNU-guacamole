@@ -71,6 +71,8 @@ def main():
     p.add_argument('--timeout', type=int, default=240)
     p.add_argument('--owned-memory-mib', type=int, default=512)
     p.add_argument('--finish', action='store_true', help='do not stop; just capture the serial log')
+    p.add_argument('--plan-json', default=None, help='process/thread layout plan JSON for the thread snapshot')
+    p.add_argument('--inspect-threads', action='store_true', help='with --plan-json, capture launchd/UI thread snapshots')
     p.add_argument('--allproc-symbol', default=None, help='dump the kernel allproc list at the final stop, resolving this symbol')
     p.add_argument('--console', action='store_true', default=True, help='capture the virtio kernel console')
     p.add_argument('--no-console', dest='console', action='store_false')
@@ -241,6 +243,11 @@ def main():
                     '--proc-pid-offset', '96',
                     '--proc-comm-offset', '52',
                     '--proc-stat-offset', '100']
+    command.append('--system-registers')
+    if a.plan_json:
+        command += ['--process-layout-plan', a.plan_json]
+        if a.inspect_threads:
+            command.append('--inspect-ui-threads')
     if a.finish:
         command.append('--finish-function')
 
