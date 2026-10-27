@@ -10,6 +10,22 @@
 #include <IOKit/storage/IOBlockStorageDevice.h>
 #include <kern/debug.h>
 #include <kern/thread.h>
+#include <vm/vm_kern.h>
+#include <vm/vm_map.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
+#include <IOKit/IOBSD.h>
+#if defined(GUAC_MEDIA_VERIFIED_ROOT) && GUAC_MEDIA_VERIFIED_ROOT
+#include "verified_root.h"
+extern "C" {
+extern const struct vr_crypto vr_xnu_crypto;
+extern const uint8_t verified_root_manifest[], verified_root_key[];
+extern const uint64_t verified_root_manifest_bytes;
+extern uint64_t sweet_ufs_media_bytes(void);
+}
+#endif
 
 
 extern "C" int sweet_ufs_media_read(uint64_t off, void *dst, uint64_t len);
@@ -20,6 +36,49 @@ uint64_t guac_media_report[3] = {
 static char guac_media_bsdname[32];
 static uint32_t guac_media_bdev;
 volatile int guac_media_stage;
+
+#if defined(GUAC_MEDIA_VERIFIED_ROOT) && GUAC_MEDIA_VERIFIED_ROOT
+/* Owner-signed block policy for this window: the manifest and key are copied
+ * out of the immutable kernel image into read-only kernel memory once, then
+ * every read is checked against the signed per-block table. */
+static struct vr_view guac_verified;
+static vm_offset_t guac_verified_storage;
+static vm_size_t guac_verified_bytes;
+volatile uint64_t guac_verified_blocks_read;
+volatile uint64_t guac_verified_failures;
+static bool guac_verified_ready;
+
+static bool
+guac_media_verified_init(void)
+{
+	if (guac_verified.hashes != nullptr) {
+		return true;
+	}
+	uint64_t manifestBytes = verified_root_manifest_bytes;
+	vm_size_t tableBytes = round_page((vm_size_t)manifestBytes);
+	if (tableBytes < manifestBytes || tableBytes > UINT64_MAX - 4096) {
+		return false;
+	}
+	guac_verified_bytes = tableBytes + 4096;
+	if (kmem_alloc(kernel_map, &guac_verified_storage, guac_verified_bytes,
+	    (kma_flags_t)(KMA_KOBJECT | KMA_DATA), VM_KERN_MEMORY_SECURITY) != KERN_SUCCESS) {
+		return false;
+	}
+	memcpy((void *)guac_verified_storage, verified_root_manifest, manifestBytes);
+	uint8_t *key = (uint8_t *)(guac_verified_storage + tableBytes);
+	memcpy(key, verified_root_key, VR_KEY_BYTES);
+	if (vm_map_protect(kernel_map, guac_verified_storage,
+	    guac_verified_storage + guac_verified_bytes, VM_PROT_READ, TRUE) != KERN_SUCCESS) {
+		return false;
+	}
+	if (vr_open((const uint8_t *)guac_verified_storage, manifestBytes, key, 1,
+	    &vr_xnu_crypto, &guac_verified) != VR_OK) {
+		return false;
+	}
+	/* The signed envelope describes exactly the window this device serves. */
+	return guac_verified.image_bytes == sweet_ufs_media_bytes();
+}
+#endif
 
 
 extern "C" const char *
@@ -85,6 +144,7 @@ GuacUfsMedia::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block,
 	uint64_t bsize = sweet_ufs_media_block_size();
 	uint64_t off = block * 512;
 	uint64_t len = count * 512;
+	uint64_t transferred = 0;
 	IOReturn result = kIOReturnSuccess;
 
 	if (buffer == nullptr || completion == nullptr || count == 0 ||
@@ -97,6 +157,83 @@ GuacUfsMedia::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block,
 	if (buffer->getLength() < len) {
 		return kIOReturnBadArgument;
 	}
+#if defined(GUAC_MEDIA_VERIFIED_ROOT) && GUAC_MEDIA_VERIFIED_ROOT
+	/*
+	 * Owner-verified path: read the aligned block span once per policy block,
+	 * authenticate it against the signed table, then expose only that CPU-owned
+	 * copy. A failed check returns no data and never reaches the filesystem.
+	 */
+	if (guac_verified_ready) {
+		uint64_t stop = off + len;
+		uint64_t aligned = off & ~((uint64_t)VR_BLOCK_BYTES - 1);
+		void *blockBuffer = IOMalloc(VR_BLOCK_BYTES);
+		if (blockBuffer == nullptr) {
+			result = kIOReturnNoMemory;
+		}
+		for (uint64_t pos = aligned; blockBuffer != nullptr && pos < stop; ) {
+			uint64_t readEnd = pos + VR_BLOCK_BYTES;
+			if (readEnd > bytes) {
+				readEnd = bytes;
+			}
+			uint32_t want = (uint32_t)(readEnd - pos);
+			if (sweet_ufs_media_read(pos, blockBuffer, want) != 0) {
+				result = kIOReturnIOError;
+				break;
+			}
+			if (vr_verify_block(&guac_verified, pos / VR_BLOCK_BYTES, blockBuffer,
+			    want, &vr_xnu_crypto) != VR_OK) {
+				__atomic_fetch_add(&guac_verified_failures, 1, __ATOMIC_RELAXED);
+				result = kIOReturnNotPrivileged;
+				break;
+			}
+			__atomic_fetch_add(&guac_verified_blocks_read, 1, __ATOMIC_RELAXED);
+			uint64_t copyStart = pos > off ? pos : off;
+			uint64_t copyEnd = readEnd < stop ? readEnd : stop;
+			if (copyEnd > copyStart &&
+			    buffer->writeBytes(copyStart - off,
+			    (uint8_t *)blockBuffer + (copyStart - pos),
+			    (vm_size_t)(copyEnd - copyStart)) != copyEnd - copyStart) {
+				result = kIOReturnUnderrun;
+				break;
+			}
+			if (copyEnd > copyStart) {
+				transferred = copyEnd - off;
+			}
+			pos = readEnd;
+		}
+		if (blockBuffer != nullptr) {
+			IOFree(blockBuffer, VR_BLOCK_BYTES);
+		}
+	} else {
+		/* Same traffic as the plain path while no signed policy covers the window. */
+		uint64_t chunk = (uint64_t)bsize * 16;
+		if (chunk == 0) {
+			result = kIOReturnNotReady;
+		} else {
+			void *bounce = IOMalloc((vm_size_t)(len < chunk ? len : chunk));
+			if (bounce == nullptr) {
+				result = kIOReturnNoMemory;
+			}
+			uint64_t done = 0;
+			for (; bounce != nullptr && done < len; ) {
+				uint64_t want = (len - done) < chunk ? (len - done) : chunk;
+				if (sweet_ufs_media_read(off + done, bounce, want) != 0) {
+					result = kIOReturnIOError;
+					break;
+				}
+				if (buffer->writeBytes(done, bounce, (vm_size_t)want) != want) {
+					result = kIOReturnUnderrun;
+					break;
+				}
+				done += want;
+				transferred = done;
+			}
+			if (bounce != nullptr) {
+				IOFree(bounce, (vm_size_t)(len < chunk ? len : chunk));
+			}
+		}
+	}
+#else
 	/* UFS path I/O is 4 KiB aligned; copy through a per-call bounce. */
 	uint64_t chunk = (uint64_t)bsize * 16;
 	if (chunk == 0) {
@@ -121,9 +258,10 @@ GuacUfsMedia::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block,
 		done += want;
 	}
 	IOFree(bounce, (vm_size_t)(len < chunk ? len : chunk));
+#endif
 	if (completion->action != nullptr) {
 		completion->action(completion->target, completion->parameter, result,
-		    result == kIOReturnSuccess ? len : done);
+		    result == kIOReturnSuccess ? len : transferred);
 	}
 	return result;
 }
@@ -260,6 +398,13 @@ guac_ufs_media_publish(void)
 	media->registerService(kIOServiceSynchronous);
 	guac_media_stage = 6;
 	printf("GUACMEDIA: registered\n");
+#if defined(GUAC_MEDIA_VERIFIED_ROOT) && GUAC_MEDIA_VERIFIED_ROOT
+	guac_verified_ready = guac_media_verified_init();
+	printf("GUACMEDIA: owner policy %s (%llu blocks, %llu bytes)\n",
+	    guac_verified_ready ? "verified" : "absent",
+	    (unsigned long long)guac_verified.block_count,
+	    (unsigned long long)guac_verified.image_bytes);
+#endif
 	{
 		/*
 		 * The kernel console overwrites its last row, so park the answer in
@@ -317,61 +462,159 @@ guac_ufs_media_publish(void)
 	return 0;
 }
 
+#if defined(GUAC_MEDIA_VERIFIED_ROOT) && GUAC_MEDIA_VERIFIED_ROOT
+extern "C" int native_ufs_block_authenticates(IOService *provider, const char *uuid,
+    uint8_t *digest);
+
+/* The mounted volume is owner-authenticated only when its UUID equals the one
+ * the signed envelope binds and this window's reads have been verified. */
+static bool
+guac_media_authenticates(const char *uuid)
+{
+	if (!guac_verified_ready || uuid == nullptr || strlen(uuid) != 36) {
+		return false;
+	}
+	static const char hex[] = "0123456789ABCDEF";
+	char expected[37];
+	unsigned at = 0;
+	for (unsigned i = 0; i < 16; ++i) {
+		if (i == 4 || i == 6 || i == 8 || i == 10) {
+			expected[at++] = '-';
+		}
+		expected[at++] = hex[guac_verified.volume_uuid[i] >> 4];
+		expected[at++] = hex[guac_verified.volume_uuid[i] & 15];
+	}
+	expected[at] = 0;
+	return strcmp(uuid, expected) == 0;
+}
+
+/*
+ * Root acceptance query used by bsd_init's owner-root audit/trust decision:
+ * resolve the mounted media by its BSD device, then require the block
+ * transport below it (this driver, or NativeUfs's windows) to authenticate the
+ * media's signed volume UUID.
+ */
+extern "C" int
+native_verified_block_root_authorized(dev_t device)
+{
+	OSDictionary *matching = IOService::serviceMatching("IOMedia");
+	OSDictionary *properties = OSDictionary::withCapacity(2);
+	OSNumber *mjr = OSNumber::withNumber(
+	    static_cast<unsigned>(major(static_cast<uint32_t>(device))), 32);
+	OSNumber *mnr = OSNumber::withNumber(
+	    static_cast<unsigned>(minor(static_cast<uint32_t>(device))), 32);
+	if (matching == nullptr || properties == nullptr || mjr == nullptr || mnr == nullptr) {
+		OSSafeReleaseNULL(mnr);
+		OSSafeReleaseNULL(mjr);
+		OSSafeReleaseNULL(properties);
+		OSSafeReleaseNULL(matching);
+		return 0;
+	}
+	bool ready = properties->setObject(kIOBSDMajorKey, mjr) &&
+	    properties->setObject(kIOBSDMinorKey, mnr) &&
+	    matching->setObject("IOPropertyMatch", properties);
+	mnr->release();
+	mjr->release();
+	properties->release();
+	OSIterator *iterator = ready ? IOService::getMatchingServices(matching) : nullptr;
+	matching->release();
+	if (iterator == nullptr) {
+		return 0;
+	}
+	bool authenticated = false;
+	unsigned matches = 0;
+	while (OSObject *object = iterator->getNextObject()) {
+		IOService *media = OSDynamicCast(IOService, object);
+		if (media == nullptr) {
+			continue;
+		}
+		if (++matches != 1) {
+			authenticated = false;
+			break;
+		}
+		OSString *uuid = OSDynamicCast(OSString, media->getProperty("UUID"));
+		if (uuid == nullptr || uuid->getLength() != 36) {
+			continue;
+		}
+		unsigned depth = 0;
+		for (IOService *provider = media; provider != nullptr && depth++ < 64;
+		    provider = provider->getProvider()) {
+			if (OSDynamicCast(GuacUfsMedia, provider) != nullptr) {
+				authenticated = guac_media_authenticates(uuid->getCStringNoCopy());
+				break;
+			}
+			int ufs = native_ufs_block_authenticates(provider, uuid->getCStringNoCopy(),
+			    nullptr);
+			if (ufs >= 0) {
+				authenticated = ufs == 1;
+				break;
+			}
+		}
+	}
+	iterator->release();
+	return authenticated && matches == 1;
+}
+#endif
+
 /*
  * Find a published IOMedia by UUID (the SystemOS cryptex volume) and return
  * its /dev path. Bring-up instrument: unlike native_verified_block_volume_device
  * it does not require the owner trust policy.
  */
+/*
+ * Find a published IOMedia by UUID (the SystemOS cryptex volume) and return
+ * its /dev path. Bring-up instrument: unlike native_verified_block_volume_device
+ * it does not require the owner trust policy, and it polls: the apfs attach of
+ * the NativeUfs-published windows is asynchronous relative to the first exec.
+ */
 extern "C" int
 guac_media_find_volume(const char *uuid, char *path, unsigned long size)
 {
-	OSDictionary *matching;
-	OSDictionary *properties;
-	OSString *wanted;
-	OSIterator *iterator;
-	int found = 0;
-
 	if (uuid == nullptr || path == nullptr || size < 6 || strlen(uuid) != 36) {
 		return 0;
 	}
 	path[0] = 0;
-	matching = IOService::serviceMatching("IOMedia");
-	properties = OSDictionary::withCapacity(1);
-	wanted = OSString::withCString(uuid);
-	if (matching == nullptr || properties == nullptr || wanted == nullptr ||
-	    !properties->setObject("UUID", wanted) || !matching->setObject("IOPropertyMatch", properties)) {
-		OSSafeReleaseNULL(wanted);
-		OSSafeReleaseNULL(properties);
+	for (unsigned int attempt = 0; attempt < 50; attempt++) {
+		OSDictionary *matching;
+		OSIterator *iterator;
+		unsigned int seen = 0;
+		int found = 0;
+
+		matching = IOService::serviceMatching("IOMedia");
+		iterator = matching ? IOService::getMatchingServices(matching) : nullptr;
+		if (iterator != nullptr) {
+			while (OSObject *object = iterator->getNextObject()) {
+				IOService *service = OSDynamicCast(IOService, object);
+				OSString *identity;
+				OSString *name;
+				if (service == nullptr) {
+					continue;
+				}
+				identity = OSDynamicCast(OSString, service->getProperty("UUID"));
+				name = OSDynamicCast(OSString, service->getProperty("BSD Name"));
+				seen++;
+				if (identity != nullptr && strcmp(identity->getCStringNoCopy(), uuid) == 0 &&
+				    name != nullptr && name->getLength() != 0 && name->getLength() < size - 6) {
+					snprintf(path, size, "/dev/%s", name->getCStringNoCopy());
+					found = 1;
+				}
+			}
+			iterator->release();
+		}
 		OSSafeReleaseNULL(matching);
-		return 0;
-	}
-	OSSafeReleaseNULL(wanted);
-	OSSafeReleaseNULL(properties);
-	iterator = IOService::getMatchingServices(matching);
-	OSSafeReleaseNULL(matching);
-	if (iterator == nullptr) {
-		return 0;
-	}
-	while (OSObject *object = iterator->getNextObject()) {
-		IOService *service = OSDynamicCast(IOService, object);
-		OSString *identity;
-		OSString *name;
-		if (service == nullptr) {
-			continue;
+		if (attempt == 0) {
+			extern volatile uint32_t native_ufs_root_step;
+			extern const char *volatile native_ufs_root_failure;
+			extern volatile uint32_t native_ufs_blocks_published;
+			printf("GUAC: media scan %u entries, %s; ufs step=%u published=%u failure=%s\n",
+			    seen, found ? "found" : "not found yet",
+			    native_ufs_root_step, native_ufs_blocks_published,
+			    native_ufs_root_failure ? native_ufs_root_failure : "-");
 		}
-		identity = OSDynamicCast(OSString, service->getProperty("UUID"));
-		name = OSDynamicCast(OSString, service->getProperty("BSD Name"));
-		printf("GUAC: media %s uuid %s\n",
-		    name ? name->getCStringNoCopy() : "-",
-		    identity ? identity->getCStringNoCopy() : "-");
-		if (identity == nullptr || strcmp(identity->getCStringNoCopy(), uuid) != 0 ||
-		    name == nullptr || name->getLength() == 0 ||
-		    name->getLength() >= size - 6) {
-			continue;
+		if (found) {
+			return 1;
 		}
-		snprintf(path, size, "/dev/%s", name->getCStringNoCopy());
-		found = 1;
+		IOSleep(100);
 	}
-	iterator->release();
-	return found;
+	return 0;
 }

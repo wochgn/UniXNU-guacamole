@@ -159,7 +159,7 @@ kernel_args = [
   "native-ufs-root=1",
   # Board integration.
   "sheng-pmgr=2",
-  "kernel_stack_pages=16",
+  "kernel_stack_pages=32",
   # Userland bring-up.
   "launchd_unsecure_cache=1",
   "ignition_level=1",

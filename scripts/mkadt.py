@@ -349,20 +349,13 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', dram_size=None,
     # Fixed low DRAM window for the UFS DMA buffers: the kernel-managed range
     # starts above 4 GiB and kmem_alloc_contig can sleep forever there.
     ufs_dma = node('ufs-dma', [ph(), ('reg', u64(dev['ufs_dma'], dev.get('ufs_dma_size', 0x20000)))])
-    # GuacUsb: the SM8150 DWC3 device controller (bsd/dev/guac_usb.c).
-    guac_usb = node('guac-usb', [
-        ph(),
-        ('compatible', cstr('snps,dwc3')),
-        ('reg', u64(dev['usb'], dev.get('usb_size', 0x100000))),
-    ])
-
     return node('device-tree', [
         ph(),
         *identity,
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, options, defaults, cpus] + ([psci] if psci is not None else []) + [arm_io, fbcon, buttons, pram, ufs_dma, guac_usb] + product + ([] if qemu else [ufs]))
+    ], [chosen, options, defaults, cpus] + ([psci] if psci is not None else []) + [arm_io, fbcon, buttons, pram, ufs_dma] + product + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':

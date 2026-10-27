@@ -52,9 +52,6 @@ DEVICES = {
         # ADT's sweet-ufs node by bsd/dev/sweet_ufs.c.
         'ufs': 0x01d84000,
         'ufs_size': 0x3000,
-        # SM8150 USB3 DWC3 device controller (device mode, CDC-ACM console).
-        'usb': 0x0A600000,
-        'usb_size': 0x100000,
         # Kryo 470: 6x A55 + 2x A76, one homogeneous SMP cluster. `reg` is
         # the raw MPIDR (Aff1:Aff0), not a logical index.
         'cpu_compat': 'qcom,kryo470',

@@ -50,6 +50,7 @@ mkdir -p db/dslocal/nodes/Default/users \
          db/audit \
          db/empty \
          db/backups \
+         cores \
          run \
          tmp \
          vm \
