@@ -10,7 +10,7 @@
 set -euo pipefail
 
 OUT=${1:-build/data-seed}
-SIZE=${DATA_SEED_SIZE:-512m}
+SIZE=${DATA_SEED_SIZE:-2g}
 VOLNAME=${DATA_SEED_VOLNAME:-Data}
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$OUT"
