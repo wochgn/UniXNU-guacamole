@@ -332,6 +332,11 @@ if [ -d "$MOCKFS_OBJECT_DIR" ]; then
 fi
 EXTRA_MAKE_ARGS+=("ubc_subr.o_CFLAGS_ADD=-DXNU_NATIVE_CS_HASH_CACHE=$CS_HASH_CACHE_MODE")
 EXTRA_CFLAGS=${XNU_EXTRA_CFLAGS:--Wno-reserved-identifier -Wno-pre-c11-compat -Wno-missing-designated-field-initializers -Wno-suggest-override -Wno-unnecessary-virtual-specifier -Wno-suggest-destructor-override -Wno-ms-bitfield-padding}
+# The QEMU virt machine has no Apple UART; give its kernel PL011 console
+# output so the boot log reaches the serial file instead of only GDB.
+if [ "${XNU_ARMVIRT_PLATFORM:-0}" = 1 ]; then
+  EXTRA_CFLAGS="$EXTRA_CFLAGS -DXNU_QEMU_PL011=1"
+fi
 OWNER_ROOT_PROBE=${XNU_VERIFIED_ROOT_PROBE:-0}
 if [ "$OWNER_ROOT_PROBE" != 0 ] && [ "$OWNER_ROOT_PROBE" != 1 ]; then
   echo 'XNU_VERIFIED_ROOT_PROBE must be 0 or 1' >&2
