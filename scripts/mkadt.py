@@ -22,7 +22,6 @@ SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -156,10 +155,9 @@ def build(seed=None, qemu=False, highmem=False, device='sweet', dram_size=None,
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('sweet-shim')),
         ('system-firmware-version', cstr('sweet-shim')),
-        # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
-        # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
-        # tolerating a missing directory). Fixed stand-in value.
-        ('boot-manifest-hash', BOOT_MANIFEST_HASH),
+        # boot-manifest-hash is deliberately absent: the kernel owner chain
+        # publishes the real digest into /chosen before init, and would refuse
+        # (status 3) to replace a stand-in that already claims the property.
         # libimg4 (cryptexd) aborts "failed to get crypto algorithm" without
         # it; real A11+ device trees say sha2-384.
         ('crypto-hash-method', cstr('sha2-384')),
