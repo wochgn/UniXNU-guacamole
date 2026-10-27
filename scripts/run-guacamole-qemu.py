@@ -65,6 +65,10 @@ def main():
     p.add_argument('--stop', default='_handle_breakpoint',
                    help='first GDB stop symbol (the user BRK handler = the dyld trap)')
     p.add_argument('--also-stop', action='append', default=[])
+    p.add_argument('--syscall-log', action='append', default=[], metavar='SYMBOL',
+                   help='observe this genuine kernel syscall handler (bounded saved-state log)')
+    p.add_argument('--syscall-number', type=int, action='append', default=[],
+                   help='capture these genuine syscall numbers (bounded saved-state log)')
     p.add_argument('--skip-target-hits', type=int, default=0,
                    help='skip earlier hits of the primary breakpoint')
     p.add_argument('--trace', action='append', default=[], metavar='SYMBOL_OR_HEX',
@@ -268,6 +272,10 @@ def main():
         command.append('--finish-function')
     if a.skip_target_hits:
         command += ['--skip-target-hits', str(a.skip_target_hits)]
+    for name in a.syscall_log:
+        command += ['--syscall-log-address', sym(name)]
+    for nr in a.syscall_number:
+        command += ['--syscall-number', str(nr)]
     if a.ramfb:
         command.append('--qemu-ramfb')
     if a.capture_screen:
