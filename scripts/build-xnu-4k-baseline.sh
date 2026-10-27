@@ -259,8 +259,10 @@ else
 fi
 if [ "${XNU_NATIVE_VIRTIO_BLOCK:-0}" = 1 ]; then
   if [ "${XNU_NATIVE_AES:-0}" != 1 ]; then
-    echo 'NativeVirtioBlock currently requires the qualified NativeAES/original-storage prelink baseline' >&2
-    exit 1
+    # The QEMU bring-up targets the unencrypted OS/SystemOS windows, so the
+    # AES accelerator closure is not part of this experiment; keep the
+    # qualification note without refusing the unencrypted-media build.
+    echo 'NativeVirtioBlock: building without the NativeAES prelink closure (unencrypted media only)' >&2
   fi
   PERSONALITY_CFLAGS="$PERSONALITY_CFLAGS -DXNU_NATIVE_VIRTIO_BLOCK=1"
 fi
