@@ -1,17 +1,26 @@
 diff --git a/.guacamole-applied b/.guacamole-applied
-index 7d3a6c5..839749e 100644
+index 7d3a6c5..973a6f8 100644
 --- a/.guacamole-applied
 +++ b/.guacamole-applied
-@@ -144,3 +144,4 @@
+@@ -144,3 +144,5 @@
  /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/0991-ipados-systemos-mount.patch 4bd900d301da82aa1bafdb14431cd035fa44864376a2cf2a4c4d606c81bb7567
  /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/zzz-current-state.patch 5184e882c9028a1702a7a4587a4f520bbcfb83ea9688adf0586d4fc440be41a1
  /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/0991-ipados-systemos-mount.patch 2ff386efa18ccb7a10ea9ee4fc8ee4020743bc28eb5657438b24812bc92bfc71
 +/home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/zzzzz-guac-qemu-systemos-union.patch e0e662c31e4ff5de460993abb7f2972aeb0b07b399cac1cbf7282afa6abffc8f
++/home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/zzzzz-guac-qemu-systemos-union.patch 81ce2b3715a6a087a222d56870ae2c99b82768651a882231b7739057e0aa20ac
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 2a2322c..3a00705 100644
+index 2a2322c..52f3c39 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -7206,8 +7206,13 @@ done:
+@@ -7028,6 +7028,7 @@ create_unix_stack(vm_map_t map, load_result_t* load_result,
+ extern int native_verified_block_volume_device(const char *, dev_t *, char *, size_t);
+ #if defined(XNU_OWNER_BOOT_MANIFEST) && XNU_OWNER_BOOT_MANIFEST
+ extern int native_owner_publish_boot_manifest(dev_t, const char *, dev_t, const char *);
++extern volatile int native_owner_boot_manifest_status;
+ #endif
+ #if defined(XNU_OWNER_CACHE_STARTUP) && XNU_OWNER_CACHE_STARTUP
+ extern void commpage_update_dyld_flags(uint64_t);
+@@ -7206,8 +7207,13 @@ done:
  	    error, cache_authorized, root_recheck, (unsigned long long)dyld_flags);
  	if (!error && cache_authorized && root_recheck) {
  		/* Original dyld bit 3 selects no ignition; the owner chain and actual
@@ -27,7 +36,7 @@ index 2a2322c..3a00705 100644
  		commpage_update_dyld_flags(dyld_flags);
  		native_owner_cache_dyld_flags = dyld_flags;
  		printf("GUAC-OWNER: startup flags=%llx\n", (unsigned long long)dyld_flags);
-@@ -8138,38 +8143,25 @@ static int
+@@ -8138,38 +8144,25 @@ static int
  guac_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
  {
  	static const char cache_uuid[] = "8846FE78-2910-4297-AF97-D59BB6F8FC16";
@@ -71,7 +80,7 @@ index 2a2322c..3a00705 100644
  	memcpy(mount_data, &spec, sizeof(spec));
  	memcpy(mount_data + 8, &mount_flags, sizeof(mount_flags));
  	memcpy(mount_data + 16, &mount_mode, sizeof(mount_mode));
-@@ -8188,17 +8180,50 @@ guac_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
+@@ -8188,17 +8181,50 @@ guac_systemos_prepare(proc_t p, user_addr_t scratch, user_addr_t *envp)
  		printf("GUAC-SYSOS: mount %s at %s probe=%d\n", device_path, mountpoint, probe_error);
  		if (!probe_error) vnode_put(probe_vp);
  	}
@@ -127,6 +136,15 @@ index 2a2322c..3a00705 100644
  	return 0;
  }
  #endif /* XNU_GUAC_SYSTEMOS_MOUNT */
+@@ -8248,7 +8274,7 @@ load_init_program(proc_t p)
+ 	boot_progress_stage("SystemOS mount enter");
+ 	int cache_error = native_owner_cache_prepare(p, (user_addr_t)scratch_addr, &init_envp);
+ 	boot_progress_stage("SystemOS mount returned");
+-	if (cache_error) panic("offline owner SystemOS mount failed: %d", cache_error);
++	if (cache_error) panic("offline owner SystemOS mount failed: %d manifest-status %d", cache_error, native_owner_boot_manifest_status);
+ #endif
+ #if defined(XNU_GUAC_DATA_MOUNT) && XNU_GUAC_DATA_MOUNT
+ 	{
 diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
 index dcebcb8..df922e4 100644
 --- a/bsd/vm/vm_unix.c
@@ -155,3 +173,55 @@ index dcebcb8..df922e4 100644
  	/* map the file(s) into that shared region's submap */
  	kr = vm_shared_region_map_file(shared_region, files_count, sr_file_mappings);
  	if (kr != KERN_SUCCESS) {
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index b28939a..e0f0480 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -3209,6 +3209,11 @@ restart:
+ 
+ 		vm_offset_t pcpu_base = current_percpu_base();
+ 		counter_inc_preemption_disabled(&vm_page_grab_count);
++		if (mem->vmp_q_state != VM_PAGE_ON_FREE_LOCAL_Q) {
++			panic("GUAC-VMQ percpu pop page %p index=%llu pa=0x%llx q_state=%d",
++			    mem, (unsigned long long)(mem - vm_page_array_beginning_addr),
++			    (unsigned long long)VM_PAGE_GET_PHYS_PAGE(mem), mem->vmp_q_state);
++		}
+ 		*PERCPU_GET_WITH_BASE(pcpu_base, free_pages) = mem->vmp_snext;
+ 		VM_DEBUG_EVENT(vm_page_grab, VM_PAGE_GRAB, DBG_FUNC_NONE, grab_options, 0, 0, 0);
+ 
+@@ -3369,7 +3374,12 @@ restart:
+ 			    mem, vmp_pageq);
+ #endif
+ 
+-			assert(mem->vmp_q_state == VM_PAGE_ON_FREE_Q);
++			if (mem->vmp_q_state != VM_PAGE_ON_FREE_Q) {
++				panic("GUAC-VMQ corrupt free page %p index=%llu pa=0x%llx q_state=%d free_count=%d",
++				    mem, (unsigned long long)(mem - vm_page_array_beginning_addr),
++				    (unsigned long long)VM_PAGE_GET_PHYS_PAGE(mem),
++				    mem->vmp_q_state, vm_page_free_count);
++			}
+ 
+ 			VM_PAGE_ZERO_PAGEQ_ENTRY(mem);
+ 
+@@ -3804,6 +3814,10 @@ vm_page_release(
+ #endif /* CONFIG_SECLUDED_MEMORY */
+ 	} else {
+ 		mem->vmp_lopage = FALSE;
++		if (mem->vmp_q_state == VM_PAGE_ON_FREE_Q) {
++			printf("GUAC-VMQ: DOUBLE FREE site1 page %p index=%llu\n",
++			    mem, (unsigned long long)(mem - vm_page_array_beginning_addr));
++		}
+ 		mem->vmp_q_state = VM_PAGE_ON_FREE_Q;
+ 
+ 		color = VM_PAGE_GET_COLOR(mem);
+@@ -3909,6 +3923,10 @@ vm_page_release_startup(
+ #endif /* CONFIG_SECLUDED_MEMORY */
+ 	} else {
+ 		mem->vmp_lopage = FALSE;
++		if (mem->vmp_q_state == VM_PAGE_ON_FREE_Q) {
++			printf("GUAC-VMQ: DOUBLE FREE site2 page %p index=%llu\n",
++			    mem, (unsigned long long)(mem - vm_page_array_beginning_addr));
++		}
+ 		mem->vmp_q_state = VM_PAGE_ON_FREE_Q;
+ 		vm_page_free_count++;
+ 		queue_free = &vm_page_queue_free[VM_PAGE_GET_COLOR(mem)].qhead;
