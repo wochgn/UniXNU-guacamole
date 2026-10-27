@@ -96,7 +96,8 @@ chmod 0755 log backups || true
 
 echo "== adding the Preboot volume (libignition preboot stage, role lookup 0x10)"
 CONTAINER_DISK=$(diskutil info -plist "$MOUNT" | plutil -extract ParentWholeDisk raw -)
-diskutil apfs addVolume "$CONTAINER_DISK" APFS Preboot -nospotlight >/dev/null
+# libignition looks the preboot volume up by APFS role bit 0x10 ("I")
+diskutil apfs addVolume "$CONTAINER_DISK" APFS Preboot -role I >/dev/null
 sleep 1
 if [ -d "/Volumes/Preboot" ]; then
   # libignition binds /private/preboot and reads cryptex staging metadata from here
@@ -106,13 +107,6 @@ if [ -d "/Volumes/Preboot" ]; then
            "/Volumes/Preboot/cryptex1/app" \
            "/Volumes/Preboot/cryptex1/flag" \
            "/Volumes/Preboot/cryptex1/firmware"
-  # try to set the APFS preboot role; role-based lookup needs the flag
-  PREBOOT_DEV=$(diskutil info -plist "/Volumes/Preboot" | plutil -extract DeviceIdentifier raw -) || PREBOOT_DEV=""
-  if [ -n "$PREBOOT_DEV" ]; then
-    diskutil apfs changeVolumeRole "$PREBOOT_DEV" preboot 2>/dev/null \
-      || diskutil apfs changeVolumeRole "$PREBOOT_DEV" p 2>/dev/null \
-      || echo "NOTE: could not set preboot role via diskutil; role lookup may still fail"
-  fi
 else
   echo "WARNING: Preboot volume did not auto-mount at /Volumes/Preboot"
 fi
