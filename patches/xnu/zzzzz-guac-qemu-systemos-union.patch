@@ -1,3 +1,12 @@
+diff --git a/.guacamole-applied b/.guacamole-applied
+index 7d3a6c5..839749e 100644
+--- a/.guacamole-applied
++++ b/.guacamole-applied
+@@ -144,3 +144,4 @@
+ /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/0991-ipados-systemos-mount.patch 4bd900d301da82aa1bafdb14431cd035fa44864376a2cf2a4c4d606c81bb7567
+ /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/zzz-current-state.patch 5184e882c9028a1702a7a4587a4f520bbcfb83ea9688adf0586d4fc440be41a1
+ /home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/0991-ipados-systemos-mount.patch 2ff386efa18ccb7a10ea9ee4fc8ee4020743bc28eb5657438b24812bc92bfc71
++/home/invalidname/UniXNU-guacamole/out/guacamole/tree/patches/xnu/zzzzz-guac-qemu-systemos-union.patch e0e662c31e4ff5de460993abb7f2972aeb0b07b399cac1cbf7282afa6abffc8f
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
 index 2a2322c..3a00705 100644
 --- a/bsd/kern/kern_exec.c
@@ -118,35 +127,31 @@ index 2a2322c..3a00705 100644
  	return 0;
  }
  #endif /* XNU_GUAC_SYSTEMOS_MOUNT */
-diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index 34c921b..d32c0fe 100644
---- a/bsd/vfs/vfs_syscalls.c
-+++ b/bsd/vfs/vfs_syscalls.c
-@@ -843,6 +843,8 @@ __mac_mount(struct proc *p, register struct __mac_mount_args *uap, __unused int3
- 	if (error) {
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index dcebcb8..df922e4 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2818,6 +2818,23 @@ _shared_region_map_and_slide(
  		return error;
  	}
-+	printf("GUAC-MNT: type=%s path=0x%llx data=0x%llx\n", fstypename,
-+	    (unsigned long long)uap->path, (unsigned long long)uap->data);
  
- retry:
- 	/*
-@@ -855,8 +857,10 @@ retry:
- 	}
- 	error = namei(&nd);
- 	if (error) {
-+		printf("GUAC-MNT: namei -> %d\n", error);
- 		goto out;
- 	}
-+	printf("GUAC-MNT: namei ok vp=%p pvp=%p\n", nd.ni_vp, nd.ni_dvp);
- 	need_nameidone = 1;
- 	vp = nd.ni_vp;
- 	pvp = nd.ni_dvp;
-@@ -959,6 +963,7 @@ retry:
- 
- 	error = mount_common(fstypename, pvp, vp, &nd.ni_cnd, uap->data, flags, 0,
- 	    labelstr, ctx);
-+	printf("GUAC-MNT: mount_common -> %d\n", error);
- 
- out:
- 
++	{
++		/* One-shot identity of the mapped files (no path walk). */
++		static int srmap_reported;
++		if (!srmap_reported) {
++			srmap_reported = 1;
++			printf("GUAC-SRMAP: files=%u region=%p\n", files_count,
++			    (void *)VM_KERNEL_ADDRPERM(shared_region));
++			for (uint32_t i = 0; i < files_count && i < 4; i++) {
++				const char *nm = vnode_getname(sr_file_mappings[i].vp);
++				printf("GUAC-SRMAP: file[%u] vp=%p name=%s size=0x%llx slide=0x%x\n",
++				    i, (void *)VM_KERNEL_ADDRPERM(sr_file_mappings[i].vp),
++				    nm ? nm : "?", (unsigned long long)sr_file_mappings[i].file_size,
++				    sr_file_mappings[i].slide);
++				if (nm) vnode_putname(nm);
++			}
++		}
++	}
+ 	/* map the file(s) into that shared region's submap */
+ 	kr = vm_shared_region_map_file(shared_region, files_count, sr_file_mappings);
+ 	if (kr != KERN_SUCCESS) {
