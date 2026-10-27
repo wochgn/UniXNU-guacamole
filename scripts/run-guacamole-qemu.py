@@ -71,6 +71,7 @@ def main():
     p.add_argument('--timeout', type=int, default=240)
     p.add_argument('--owned-memory-mib', type=int, default=512)
     p.add_argument('--finish', action='store_true', help='do not stop; just capture the serial log')
+    p.add_argument('--allproc-symbol', default=None, help='dump the kernel allproc list at the final stop, resolving this symbol')
     p.add_argument('--console', action='store_true', default=True, help='capture the virtio kernel console')
     p.add_argument('--no-console', dest='console', action='store_false')
     a = p.parse_args()
@@ -234,6 +235,12 @@ def main():
         command += ['--read-memory', f'{sym(nm)}:{int(size, 0):x}']
     for request in a.read_address:
         command += ['--read-memory', request]
+    if a.allproc_symbol:
+        command += ['--allproc-address', sym(a.allproc_symbol),
+                    '--proc-list-offset', '0',
+                    '--proc-pid-offset', '96',
+                    '--proc-comm-offset', '52',
+                    '--proc-stat-offset', '100']
     if a.finish:
         command.append('--finish-function')
 
